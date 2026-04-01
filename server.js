@@ -20,6 +20,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 // ==================== STATE ====================
 const players = new Map(); // socketId -> { username, pseudo, online }
 const rooms = new Map();   // roomId -> { id, hostId, players: [{socketId, username, pseudo, ready}], mode, status }
+const pendingInvites = new Map(); // username -> [{ fromUsername, fromPseudo, timestamp }]
 
 function genRoomId() {
   return 'room_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
@@ -91,6 +92,9 @@ io.on('connection', (socket) => {
   // Send friend list on connect
   sendFriendList(socket, uname);
 
+  // Send pending invites on connect
+  sendPendingInvites(socket, uname);
+
   // ==================== FRIEND INVITE ====================
   socket.on('invite_friend', async ({ targetUsername }) => {
     const target = targetUsername.toLowerCase();
@@ -104,7 +108,9 @@ io.on('connection', (socket) => {
       }
     }
 
-    // Find target socket
+    const inviterPseudo = players.get(socket.id)?.pseudo || pseudo;
+
+    // Find target socket (if online)
     let targetSocket = null;
     for (const [sid, p] of players) {
       if (p.username === target) {
@@ -113,32 +119,58 @@ io.on('connection', (socket) => {
       }
     }
 
-    if (!targetSocket) {
-      safeEmit(socket, 'invite_error', { message: 'Cet ami n\'est pas en ligne.' });
-      return;
-    }
+    if (targetSocket) {
+      // Target is online - check if already in a room
+      let targetRoom = null;
+      for (const [, room] of rooms) {
+        if (room.players.some(p => p.username === target)) {
+          targetRoom = room;
+          break;
+        }
+      }
 
-    // Check if target already in a room
-    let targetRoom = null;
-    for (const [, room] of rooms) {
-      if (room.players.some(p => p.username === target)) {
-        targetRoom = room;
-        break;
+      if (targetRoom) {
+        safeEmit(socket, 'invite_error', { message: 'Cet ami est déjà en partie.' });
+        return;
+      }
+
+      // Send real-time notification
+      safeEmit(targetSocket, 'invite_received', {
+        fromUsername: uname,
+        fromPseudo: inviterPseudo,
+        roomId: null,
+      });
+    } else {
+      // Target is offline - store invite in Supabase
+      try {
+        const { data: targetData } = await supabase
+          .from('players')
+          .select('friend_requests')
+          .eq('username', target)
+          .single();
+
+        if (targetData) {
+          let invites = [];
+          try {
+            const raw = targetData.friend_requests;
+            invites = typeof raw === 'string' ? JSON.parse(raw) : (raw || []);
+          } catch (e) {}
+
+          // Add invite if not duplicate
+          if (!invites.some(i => i.fromUsername === uname)) {
+            invites.push({ fromUsername: uname, fromPseudo: inviterPseudo, timestamp: Date.now() });
+            // Keep only last 10 invites
+            if (invites.length > 10) invites = invites.slice(-10);
+            await supabase
+              .from('players')
+              .update({ friend_requests: JSON.stringify(invites) })
+              .eq('username', target);
+          }
+        }
+      } catch (e) {
+        console.error('Failed to store offline invite:', e);
       }
     }
-
-    if (targetRoom) {
-      safeEmit(socket, 'invite_error', { message: 'Cet ami est déjà en partie.' });
-      return;
-    }
-
-    // Send invitation
-    const inviterPseudo = players.get(socket.id)?.pseudo || pseudo;
-    safeEmit(targetSocket, 'invite_received', {
-      fromUsername: uname,
-      fromPseudo: inviterPseudo,
-      roomId: null, // will be set when accepted
-    });
 
     safeEmit(socket, 'invite_sent', { targetUsername: target });
   });
@@ -366,7 +398,7 @@ async function sendFriendList(socket, username) {
   try {
     const { data, error } = await supabase
       .from('players')
-      .select('username, pseudo, online')
+      .select('username, pseudo, online, friends')
       .eq('username', username)
       .single();
 
@@ -410,6 +442,47 @@ async function sendFriendList(socket, username) {
     safeEmit(socket, 'friend_list', { friends: friendData });
   } catch (e) {
     console.error('sendFriendList error:', e);
+  }
+}
+
+async function sendPendingInvites(socket, username) {
+  try {
+    const { data } = await supabase
+      .from('players')
+      .select('friend_requests')
+      .eq('username', username)
+      .single();
+
+    if (!data) return;
+
+    let invites = [];
+    try {
+      const raw = data.friend_requests;
+      invites = typeof raw === 'string' ? JSON.parse(raw) : (raw || []);
+    } catch (e) {}
+
+    // Filter out invites older than 1 hour
+    const oneHourAgo = Date.now() - 3600000;
+    invites = invites.filter(i => i.timestamp > oneHourAgo);
+
+    // Send each pending invite
+    for (const invite of invites) {
+      safeEmit(socket, 'invite_received', {
+        fromUsername: invite.fromUsername,
+        fromPseudo: invite.fromPseudo,
+        roomId: null,
+      });
+    }
+
+    // Clear old invites
+    if (invites.length > 0) {
+      await supabase
+        .from('players')
+        .update({ friend_requests: JSON.stringify(invites) })
+        .eq('username', username);
+    }
+  } catch (e) {
+    console.error('sendPendingInvites error:', e);
   }
 }
 
