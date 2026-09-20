@@ -1,15 +1,16 @@
 {
-  "name": "bandana-fighters-server",
-  "version": "2.0.0",
-  "description": "Socket.IO multiplayer server for Bandana Fighters",
+  "name": "bandana-fighters-online",
+  "version": "1.0.0",
+  "description": "Bandana Fighters Remaster — serveur multijoueur en ligne (Node.js + WebSocket)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "BOSS_CHANCE=1 node server.js"
   },
+  "engines": { "node": ">=16" },
+  "license": "UNLICENSED",
+  "private": true,
   "dependencies": {
-    "express": "^4.18.2",
-    "socket.io": "^4.7.4",
-    "@supabase/supabase-js": "^2.39.0"
+    "ws": "^8.18.0"
   }
 }
