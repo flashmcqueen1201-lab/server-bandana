@@ -1149,6 +1149,8 @@ function makePlayer(
     maxHp,
 
     alive: true,
+    koAt: null,
+    reviveRemaining: 0,
 
     l: 0,
     r: 0,
@@ -1206,6 +1208,10 @@ function createSim(room) {
     boss: null,
 
     score: 0,
+    wave: 1,
+    waveSpawned: 0,
+    waveTarget: 5,
+    waveBreak: 0,
 
     spawnTimer: 0,
 
@@ -1399,6 +1405,8 @@ function damagePlayer(
 
     p.alive =
       false;
+    p.koAt = sim.now;
+    p.reviveRemaining = sim.mode !== 'duel' ? 5000 : 0;
 
     p.l = 0;
     p.r = 0;
@@ -2178,8 +2186,7 @@ function playerAttack(
     };
 
     if (
-      sim.mode ===
-      'coop'
+      (sim.mode === 'coop' || sim.mode === 'waves')
     ) {
       sim.enemies.forEach(
         en => {
@@ -3049,8 +3056,7 @@ function stepSim(
   );
 
   if (
-    sim.mode ===
-    'coop'
+    (sim.mode === 'coop' || sim.mode === 'waves')
   ) {
     updateEnemies(
       sim,
@@ -3082,25 +3088,25 @@ function stepSim(
             !e.dead
         ).length;
 
-      if (
-        sim.spawnTimer >=
-          sim.spawnInterval &&
-        alive <
-          COOP_MAX_ENEMIES
-      ) {
-        sim.spawnTimer =
-          0;
-
-        spawnEnemy(
-          sim
-        );
-
-        sim.spawnInterval =
-          Math.max(
-            COOP_SPAWN_MIN,
-            sim.spawnInterval -
-              35
-          );
+      if (sim.mode === 'waves' && sim.waveBreak > 0) {
+        sim.waveBreak -= dt * 1000;
+        if (sim.waveBreak <= 0) {
+          sim.wave++;
+          sim.waveSpawned = 0;
+          sim.waveTarget = Math.min(12, 4 + sim.wave);
+          sim.spawnTimer = sim.spawnInterval;
+          ev(sim, { k:'wave', n:sim.wave, phase:'start' });
+        }
+      } else if (sim.spawnTimer >= sim.spawnInterval && alive < COOP_MAX_ENEMIES &&
+          (sim.mode !== 'waves' || sim.waveSpawned < sim.waveTarget)) {
+        sim.spawnTimer = 0;
+        spawnEnemy(sim);
+        if (sim.mode === 'waves') sim.waveSpawned++;
+        sim.spawnInterval = Math.max(COOP_SPAWN_MIN, sim.spawnInterval - 35);
+      }
+      if (sim.mode === 'waves' && sim.waveSpawned >= sim.waveTarget && alive === 0 && !sim.boss && sim.waveBreak <= 0) {
+        sim.waveBreak = 2500;
+        ev(sim, { k:'wave', n:sim.wave, phase:'end' });
       }
     }
 
@@ -3125,16 +3131,30 @@ function stepSim(
           !c.dead
       );
 
-    if (
-      sim.players.every(
-        p =>
-          !p.alive
-      )
-    ) {
-      sim.ending = {
-        reason: 'dead',
-        winner: -1
-      };
+    if (sim.mode !== 'duel') {
+      const down = sim.players.filter(p => !p.alive);
+      const living = sim.players.filter(p => p.alive);
+      if (down.length === 2) {
+        sim.ending = { reason:'dead', winner:-1 };
+      } else if (down.length === 1 && living.length === 1) {
+        const p = down[0];
+        p.reviveRemaining = Math.max(0, 5000 - (sim.now - (p.koAt || sim.now)));
+        if (sim.now - (p.koAt || sim.now) >= 5000) {
+          p.alive = true;
+          p.hp = Math.max(1, Math.round(p.maxHp * 0.5));
+          p.koAt = null;
+          p.reviveRemaining = 0;
+          p.invulnUntil = sim.now + 1200;
+          p.x = clamp(living[0].x + (p.slot === 0 ? -42 : 42), 6, GAME_W - 6 - p.width);
+          p.y = GROUND_Y - p.height; p.vx = 0; p.vy = 0; p.onGround = true;
+          ev(sim, { k:'revive', s:p.slot, hp:p.hp });
+        }
+      }
+    } else {
+      const [a,b] = sim.players;
+      if (!a.alive || !b.alive) {
+        sim.ending = { reason:'ko', winner:a.alive ? 0 : b.alive ? 1 : -1 };
+      }
     }
   } else {
     const [
@@ -3183,6 +3203,7 @@ function buildSnap(
 
     sc:
       sim.score,
+    wave: sim.wave || 1,
 
     p:
       sim.players.map(
@@ -3220,6 +3241,7 @@ function buildSnap(
             p.alive
               ? 1
               : 0,
+          rr: p.reviveRemaining || 0,
 
           iv:
             sim.now <
@@ -3302,8 +3324,7 @@ function buildSnap(
     );
 
   if (
-    sim.mode ===
-    'coop'
+    (sim.mode === 'coop' || sim.mode === 'waves')
   ) {
     snap.en =
       sim.enemies.map(
@@ -3900,7 +3921,9 @@ function handle(
         m.mode !==
           'coop' &&
         m.mode !==
-          'duel'
+          'duel' &&
+        m.mode !==
+          'waves'
       ) {
         return;
       }
