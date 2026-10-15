@@ -365,7 +365,17 @@ const server =
         path.join(PUBLIC_DIR, urlPath)
       );
 
-    if (!filePath.startsWith(PUBLIC_DIR)) {
+    /* Vérification fiable : un dossier voisin comme "public-old" commence par "public"
+       mais n'est pas DANS public. On compare donc via un chemin relatif. */
+    const rel = path.relative(PUBLIC_DIR, filePath);
+
+    if (
+      urlPath.indexOf('\0') !== -1 ||
+      !rel ||
+      rel === '..' ||
+      rel.startsWith('..' + path.sep) ||
+      path.isAbsolute(rel)
+    ) {
       res.writeHead(403);
       res.end('Forbidden');
       return;
@@ -3844,7 +3854,8 @@ function lbLoad() {
       const wave = Number.isInteger(e.wave) && e.wave >= 1 && e.wave <= LB_MAX_WAVE ? e.wave : 0;
       const score = Number.isInteger(e.score) && e.score >= 1 && e.score <= LB_MAX_SCORE ? e.score : 0;
       if (!wave && !score) continue;
-      lbPlayers.set(id, { n, wave, waveAt: +e.waveAt || 0, score, scoreAt: +e.scoreAt || 0 });
+      const sy = e.sync && typeof e.sync === 'object' ? e.sync : {};
+      lbPlayers.set(id, { n, wave, waveAt: +e.waveAt || 0, score, scoreAt: +e.scoreAt || 0, sync: { score: sy.score ? 1 : 0, wave: sy.wave ? 1 : 0 } });
       if (lbPlayers.size >= LB_MAX_PLAYERS) break;
     }
     console.log('[leaderboard] ' + lbPlayers.size + ' joueur(s) chargé(s)');
@@ -3898,11 +3909,45 @@ function lbRateOk(ws) {
   return r.n <= 30;
 }
 
+/* Reprise d'un record DÉJÀ obtenu avant l'existence du classement (sans durée de partie vérifiable).
+   Limites : une seule reprise par joueur et par catégorie, bornes absolues, jamais de baisse d'un record.
+   La valeur vient du client et ne peut pas être prouvée : même niveau de confiance que le reste du classement. */
+function lbSync(ws, kind, m) {
+  const fail = code => send(ws, { t: 'lb_ack', ok: false, kind, code });
+  if (!lbRateOk(ws)) return fail('RATE');
+  const id = typeof m.id === 'string' ? m.id : '';
+  const name = lbCleanName(m.name);
+  const v = m.v;
+  if (!LB_ID_RE.test(id)) return fail('BAD_ID');
+  if (!LB_NAME_RE.test(name)) return fail('BAD_NAME');
+  const max = kind === 'wave' ? LB_MAX_WAVE : LB_MAX_SCORE;
+  if (!Number.isInteger(v) || v < 1 || v > max) return fail('BAD_VALUE');
+  let e = lbPlayers.get(id);
+  if (e && e.sync && e.sync[kind]) return fail('ALREADY');
+  if (!e) {
+    if (lbPlayers.size >= LB_MAX_PLAYERS) return fail('FULL');
+    e = { n: name, wave: 0, waveAt: 0, score: 0, scoreAt: 0, sync: {} };
+    lbPlayers.set(id, e);
+  }
+  e.n = name;
+  if (!e.sync) e.sync = {};
+  e.sync[kind] = 1;
+  let improved = false;
+  if (v > e[kind]) { e[kind] = v; e[kind + 'At'] = Date.now(); improved = true; }
+  lbSaveSoon();
+  send(ws, { t: 'lb_ack', ok: true, kind, improved, synced: true });
+  lbSendBoard(ws, kind, id);
+}
+
 function lbHandle(ws, m) {
   const kind = m.kind === 'wave' || m.kind === 'score' ? m.kind : null;
   if (!kind) return;
   if (m.t === 'lb_get') {
     lbSendBoard(ws, kind, typeof m.id === 'string' ? m.id : '');
+    return;
+  }
+  if (m.t === 'lb_sync') {
+    lbSync(ws, kind, m);
     return;
   }
   // lb_submit
@@ -3918,21 +3963,20 @@ function lbHandle(ws, m) {
   if (kind === 'wave' && (v > LB_MAX_WAVE || v > 2 + dur / 4)) return fail('IMPLAUSIBLE');
   if (kind === 'score' && (v > LB_MAX_SCORE || v > 500 + dur * 350)) return fail('IMPLAUSIBLE');
   const now = Date.now();
-  const rateKey = id + ':' + kind; // score et vague ont chacun leur limite
-  if (now - (lbLastById.get(rateKey) || 0) < 2000) return fail('RATE');
-  lbLastById.set(rateKey, now);
+  if (now - (lbLastById.get(id) || 0) < 2000) return fail('RATE');
+  lbLastById.set(id, now);
   if (lbLastById.size > 20000) lbLastById.clear();
   let e = lbPlayers.get(id);
   if (!e) {
     if (lbPlayers.size >= LB_MAX_PLAYERS) return fail('FULL');
-    e = { n: name, wave: 0, waveAt: 0, score: 0, scoreAt: 0 };
+    e = { n: name, wave: 0, waveAt: 0, score: 0, scoreAt: 0, sync: {} };
     lbPlayers.set(id, e);
   }
   e.n = name;                                        // pseudo actualisé, identité (id) conservée
   const vk = kind, tk = kind + 'At';
   let improved = false;
   if (v > e[vk]) { e[vk] = v; e[tk] = now; improved = true; }   // uniquement les vrais records
-  lbSaveSoon();
+  if (improved || true) lbSaveSoon();
   send(ws, { t: 'lb_ack', ok: true, kind, improved });
   lbSendBoard(ws, kind, id);
 }
@@ -3955,6 +3999,7 @@ function handle(
 
   switch (m.t) {
     case 'lb_get':
+    case 'lb_sync':
     case 'lb_submit':
       lbHandle(ws, m);
       return;
