@@ -3918,8 +3918,9 @@ function lbHandle(ws, m) {
   if (kind === 'wave' && (v > LB_MAX_WAVE || v > 2 + dur / 4)) return fail('IMPLAUSIBLE');
   if (kind === 'score' && (v > LB_MAX_SCORE || v > 500 + dur * 350)) return fail('IMPLAUSIBLE');
   const now = Date.now();
-  if (now - (lbLastById.get(id) || 0) < 2000) return fail('RATE');
-  lbLastById.set(id, now);
+  const rateKey = id + ':' + kind; // score et vague ont chacun leur limite
+  if (now - (lbLastById.get(rateKey) || 0) < 2000) return fail('RATE');
+  lbLastById.set(rateKey, now);
   if (lbLastById.size > 20000) lbLastById.clear();
   let e = lbPlayers.get(id);
   if (!e) {
@@ -3931,7 +3932,7 @@ function lbHandle(ws, m) {
   const vk = kind, tk = kind + 'At';
   let improved = false;
   if (v > e[vk]) { e[vk] = v; e[tk] = now; improved = true; }   // uniquement les vrais records
-  if (improved || true) lbSaveSoon();
+  lbSaveSoon();
   send(ws, { t: 'lb_ack', ok: true, kind, improved });
   lbSendBoard(ws, kind, id);
 }
