@@ -3807,6 +3807,138 @@ setInterval(
 );
 
 /* -----------------------------------------------------------------------------
+   CLASSEMENT PARTAGÉ (meilleure vague / meilleur score Arcade)
+   Persistance : fichier JSON (LB_FILE, défaut ./leaderboard.json), écriture atomique.
+   NB : sur un hébergement à disque éphémère (Render gratuit), le fichier est perdu
+   à chaque redéploiement : monter un disque persistant et pointer LB_FILE dessus.
+   Les parties solo tournent côté client : les contrôles ci-dessous (bornes, cohérence
+   durée/valeur, limites de débit) réduisent la triche mais ne l'excluent pas.
+   ----------------------------------------------------------------------------- */
+
+const LB_FILE = process.env.LB_FILE || path.join(__dirname, 'leaderboard.json');
+const LB_MAX_PLAYERS = 5000;
+const LB_TOP = 50;
+const LB_MAX_WAVE = 300;
+const LB_MAX_SCORE = 3000000;
+const LB_ID_RE = /^[a-z0-9]{16,32}$/;
+const LB_NAME_RE = /^[\p{L}\p{N} _.\-]{3,16}$/u;
+const lbPlayers = new Map();      // id -> { n, wave, waveAt, score, scoreAt }
+const lbRate = new Map();         // ip -> { n, reset }
+const lbLastById = new Map();     // id -> timestamp dernier envoi
+let lbSaveTimer = null;
+
+function lbCleanName(v) {
+  if (typeof v !== 'string') return '';
+  return v.replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e]/g, '').replace(/\s+/g, ' ').trim();
+}
+
+function lbLoad() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(LB_FILE, 'utf8'));
+    const src = raw && typeof raw.players === 'object' && raw.players ? raw.players : {};
+    for (const id of Object.keys(src)) {
+      const e = src[id];
+      if (!LB_ID_RE.test(id) || !e) continue;
+      const n = lbCleanName(e.n);
+      if (!LB_NAME_RE.test(n)) continue;
+      const wave = Number.isInteger(e.wave) && e.wave >= 1 && e.wave <= LB_MAX_WAVE ? e.wave : 0;
+      const score = Number.isInteger(e.score) && e.score >= 1 && e.score <= LB_MAX_SCORE ? e.score : 0;
+      if (!wave && !score) continue;
+      lbPlayers.set(id, { n, wave, waveAt: +e.waveAt || 0, score, scoreAt: +e.scoreAt || 0 });
+      if (lbPlayers.size >= LB_MAX_PLAYERS) break;
+    }
+    console.log('[leaderboard] ' + lbPlayers.size + ' joueur(s) chargé(s)');
+  } catch (e) {
+    if (e.code !== 'ENOENT') console.error('[leaderboard] lecture impossible, démarrage à vide :', e.message);
+  }
+}
+
+function lbSaveSoon() {
+  if (lbSaveTimer) return;
+  lbSaveTimer = setTimeout(() => {
+    lbSaveTimer = null;
+    try {
+      const out = { v: 1, players: {} };
+      for (const [id, e] of lbPlayers) out.players[id] = e;
+      const tmp = LB_FILE + '.tmp';
+      fs.writeFileSync(tmp, JSON.stringify(out));
+      fs.renameSync(tmp, LB_FILE);
+    } catch (e) {
+      console.error('[leaderboard] écriture impossible :', e.message);
+    }
+  }, 2000);
+}
+
+function lbRanked(kind) {
+  const vk = kind === 'wave' ? 'wave' : 'score';
+  const tk = vk + 'At';
+  const arr = [];
+  for (const [id, e] of lbPlayers) if (e[vk] > 0) arr.push({ id, n: e.n, v: e[vk], at: e[tk] });
+  arr.sort((a, b) => b.v - a.v || a.at - b.at || (a.id < b.id ? -1 : 1));   // égalité : record atteint en premier
+  return arr;
+}
+
+function lbSendBoard(ws, kind, id) {
+  const arr = lbRanked(kind);
+  const rows = arr.slice(0, LB_TOP).map((e, i) => ({ r: i + 1, n: e.n, v: e.v, me: !!(id && e.id === id) }));
+  let me = null;
+  if (id && LB_ID_RE.test(id)) {
+    const i = arr.findIndex(e => e.id === id);
+    if (i >= 0) me = { r: i + 1, n: arr[i].n, v: arr[i].v };
+  }
+  send(ws, { t: 'lb', kind, rows, me, total: arr.length });
+}
+
+function lbRateOk(ws) {
+  const ip = ws.ip || 'x';
+  const now = Date.now();
+  let r = lbRate.get(ip);
+  if (!r || now > r.reset) { r = { n: 0, reset: now + 600000 }; lbRate.set(ip, r); }
+  r.n++;
+  return r.n <= 30;
+}
+
+function lbHandle(ws, m) {
+  const kind = m.kind === 'wave' || m.kind === 'score' ? m.kind : null;
+  if (!kind) return;
+  if (m.t === 'lb_get') {
+    lbSendBoard(ws, kind, typeof m.id === 'string' ? m.id : '');
+    return;
+  }
+  // lb_submit
+  const fail = code => send(ws, { t: 'lb_ack', ok: false, kind, code });
+  if (!lbRateOk(ws)) return fail('RATE');
+  const id = typeof m.id === 'string' ? m.id : '';
+  const name = lbCleanName(m.name);
+  const v = m.v, dur = m.dur;
+  if (!LB_ID_RE.test(id)) return fail('BAD_ID');
+  if (!LB_NAME_RE.test(name)) return fail('BAD_NAME');
+  if (!Number.isInteger(v) || v < 1) return fail('BAD_VALUE');
+  if (!Number.isInteger(dur) || dur < 5 || dur > 86400) return fail('BAD_DURATION');
+  if (kind === 'wave' && (v > LB_MAX_WAVE || v > 2 + dur / 4)) return fail('IMPLAUSIBLE');
+  if (kind === 'score' && (v > LB_MAX_SCORE || v > 500 + dur * 350)) return fail('IMPLAUSIBLE');
+  const now = Date.now();
+  if (now - (lbLastById.get(id) || 0) < 2000) return fail('RATE');
+  lbLastById.set(id, now);
+  if (lbLastById.size > 20000) lbLastById.clear();
+  let e = lbPlayers.get(id);
+  if (!e) {
+    if (lbPlayers.size >= LB_MAX_PLAYERS) return fail('FULL');
+    e = { n: name, wave: 0, waveAt: 0, score: 0, scoreAt: 0 };
+    lbPlayers.set(id, e);
+  }
+  e.n = name;                                        // pseudo actualisé, identité (id) conservée
+  const vk = kind, tk = kind + 'At';
+  let improved = false;
+  if (v > e[vk]) { e[vk] = v; e[tk] = now; improved = true; }   // uniquement les vrais records
+  if (improved || true) lbSaveSoon();
+  send(ws, { t: 'lb_ack', ok: true, kind, improved });
+  lbSendBoard(ws, kind, id);
+}
+
+lbLoad();
+
+/* -----------------------------------------------------------------------------
    MESSAGES CLIENT -> SERVEUR
    ----------------------------------------------------------------------------- */
 
@@ -3821,6 +3953,11 @@ function handle(
     ws.seat;
 
   switch (m.t) {
+    case 'lb_get':
+    case 'lb_submit':
+      lbHandle(ws, m);
+      return;
+
     case 'create':
 
       if (room) {
@@ -4145,7 +4282,8 @@ function handle(
 
 wss.on(
   'connection',
-  ws => {
+  (ws, req) => {
+    ws.ip = String((req && req.headers && req.headers['x-forwarded-for']) || (req && req.socket && req.socket.remoteAddress) || 'x').split(',')[0].trim().slice(0, 64);
     if (
       wss.clients.size >
       MAX_CLIENTS
