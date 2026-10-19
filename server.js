@@ -3038,6 +3038,10 @@ function stepSim(
         }
       );
 
+      if (sim.mode === 'waves') {
+        ev(sim, { k: 'wave', n: sim.wave, phase: 'start' });
+      }
+
       if (
         process.env.START_BOSS &&
         sim.mode ===
@@ -3585,6 +3589,11 @@ function finishGame(
 
     score:
       sim.score,
+
+    wave:
+      sim.mode === 'waves'
+        ? sim.wave
+        : 0,
 
     coins:
       sim.players.map(
