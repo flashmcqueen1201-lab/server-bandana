@@ -1552,16 +1552,36 @@ function pickEnemyType() {
   return ENEMY_TYPES.thrower;
 }
 
+/* ---- Vagues : équilibrage selon la vague et le nombre de joueurs ---- */
+function wavePlayersMult(sim) { return sim.players.length >= 2 ? 1.6 : 1; }
+function waveHpMult(sim) { return (1 + 0.06 * Math.max(0, sim.wave - 1)) * wavePlayersMult(sim); }
+function waveTargetFor(sim) {
+  const base = Math.min(12, 4 + sim.wave);
+  return sim.players.length >= 2 ? Math.ceil(base * 1.5) : base;
+}
+function waveMaxEnemies(sim) { return sim.players.length >= 2 ? COOP_MAX_ENEMIES + 3 : COOP_MAX_ENEMIES; }
+// Début de vague : toutes les 5 vagues, un boss remplace les ennemis normaux.
+function beginWave(sim) {
+  sim.waveSpawned = 0;
+  sim.waveTarget = waveTargetFor(sim);
+  ev(sim, { k:'wave', n:sim.wave, phase:'start' });
+  if (sim.wave % 5 === 0 && !sim.boss) {
+    sim.waveSpawned = sim.waveTarget;
+    spawnBoss(sim, sim.wave);
+  }
+}
+
 function spawnEnemy(sim) {
   const t =
     pickEnemyType();
 
-  const hp =
+  let hp =
     t.hpBase +
     Math.floor(
       sim.score / 120
     ) *
       2;
+  if (sim.mode === 'waves') hp = Math.round(hp * waveHpMult(sim));
 
   const fromLeft =
     Math.random() <
@@ -1634,6 +1654,7 @@ function spawnEnemy(sim) {
 function checkBossTrigger(
   sim
 ) {
+  if (sim.mode === 'waves') return;   // Vagues : boss planifiés (toutes les 5 vagues)
   const tier =
     Math.floor(
       sim.score / 200
@@ -1674,7 +1695,7 @@ function spawnBoss(
   sim,
   tier
 ) {
-  const hp =
+  let hp =
     Math.round(
       (
         260 +
@@ -1682,6 +1703,7 @@ function spawnBoss(
       ) *
         COOP_BOSS_HP_MULT
     );
+  if (sim.mode === 'waves') hp = Math.round(hp * (1 + 0.06 * Math.max(0, tier - 1)) * wavePlayersMult(sim));
 
   const avgX =
     sim.players.reduce(
@@ -2836,6 +2858,22 @@ function updateProjectiles(
             }
           }
         }
+      } else if (pr.weapon === 'enemy') {
+        // Tir d'ennemi (Coop / Vagues) : touche les JOUEURS (jamais les ennemis ni le boss)
+        for (const p of sim.players) {
+          if (
+            p.alive &&
+            !pr.hitSlots.has(p.slot) &&
+            rectsIntersect(hitbox, p)
+          ) {
+            if (damagePlayer(sim, p, pr.damage, pr.x)) {
+              pr.hitSlots.add(p.slot);
+              ev(sim, { k: 'phit', w: pr.weapon, x: r1(pr.x), y: r1(pr.y), d: pr.damage });
+              pr.dead = true;
+              break;
+            }
+          }
+        }
       } else {
         for (
           const en of
@@ -3039,7 +3077,7 @@ function stepSim(
       );
 
       if (sim.mode === 'waves') {
-        ev(sim, { k: 'wave', n: sim.wave, phase: 'start' });
+        beginWave(sim);
       }
 
       if (
@@ -3106,12 +3144,10 @@ function stepSim(
         sim.waveBreak -= dt * 1000;
         if (sim.waveBreak <= 0) {
           sim.wave++;
-          sim.waveSpawned = 0;
-          sim.waveTarget = Math.min(12, 4 + sim.wave);
           sim.spawnTimer = sim.spawnInterval;
-          ev(sim, { k:'wave', n:sim.wave, phase:'start' });
+          beginWave(sim);
         }
-      } else if (sim.spawnTimer >= sim.spawnInterval && alive < COOP_MAX_ENEMIES &&
+      } else if (sim.spawnTimer >= sim.spawnInterval && alive < (sim.mode === 'waves' ? waveMaxEnemies(sim) : COOP_MAX_ENEMIES) &&
           (sim.mode !== 'waves' || sim.waveSpawned < sim.waveTarget)) {
         sim.spawnTimer = 0;
         spawnEnemy(sim);
