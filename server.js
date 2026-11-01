@@ -349,7 +349,8 @@ const server =
           rooms: rooms.size,
           clients: wss
             ? wss.clients.size
-            : 0
+            : 0,
+          leaderboard: typeof lbPlayers !== 'undefined' ? lbPlayers.size : 0
         })
       );
 
@@ -3870,7 +3871,7 @@ setInterval(
    durée/valeur, limites de débit) réduisent la triche mais ne l'excluent pas.
    ----------------------------------------------------------------------------- */
 
-const LB_FILE = process.env.LB_FILE || path.join(__dirname, 'leaderboard.json');
+const LB_FILE = path.resolve(process.env.LB_FILE || path.join(__dirname, 'leaderboard.json'));
 const LB_MAX_PLAYERS = 5000;
 const LB_TOP = 50;
 const LB_MAX_WAVE = 300;
@@ -3909,20 +3910,41 @@ function lbLoad() {
   }
 }
 
+function lbSaveNow() {
+  let tmp = null;
+  try {
+    fs.mkdirSync(path.dirname(LB_FILE), { recursive: true });
+    const out = { v: 1, players: {} };
+    for (const [id, e] of lbPlayers) out.players[id] = e;
+    tmp = LB_FILE + '.' + process.pid + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(out), 'utf8');
+    fs.renameSync(tmp, LB_FILE);
+    return true;
+  } catch (e) {
+    if (tmp) {
+      try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch (_) {}
+    }
+    console.error('[leaderboard] écriture impossible (' + LB_FILE + '):', e.message);
+    return false;
+  }
+}
+
 function lbSaveSoon() {
-  if (lbSaveTimer) return;
+  if (lbSaveTimer) clearTimeout(lbSaveTimer);
   lbSaveTimer = setTimeout(() => {
     lbSaveTimer = null;
-    try {
-      const out = { v: 1, players: {} };
-      for (const [id, e] of lbPlayers) out.players[id] = e;
-      const tmp = LB_FILE + '.tmp';
-      fs.writeFileSync(tmp, JSON.stringify(out));
-      fs.renameSync(tmp, LB_FILE);
-    } catch (e) {
-      console.error('[leaderboard] écriture impossible :', e.message);
-    }
-  }, 2000);
+    lbSaveNow();
+  }, 750);
+}
+
+function lbFlushAndExit(signal) {
+  if (lbSaveTimer) {
+    clearTimeout(lbSaveTimer);
+    lbSaveTimer = null;
+  }
+  lbSaveNow();
+  console.log('[leaderboard] sauvegarde finale terminée (' + signal + ')');
+  process.exit(0);
 }
 
 function lbRanked(kind) {
@@ -4021,12 +4043,15 @@ function lbHandle(ws, m) {
   const vk = kind, tk = kind + 'At';
   let improved = false;
   if (v > e[vk]) { e[vk] = v; e[tk] = now; improved = true; }   // uniquement les vrais records
-  if (improved || true) lbSaveSoon();
+  // Sauvegarde aussi les changements de pseudo, même si le record ne progresse pas.
+  lbSaveSoon();
   send(ws, { t: 'lb_ack', ok: true, kind, improved });
   lbSendBoard(ws, kind, id);
 }
 
 lbLoad();
+process.once('SIGTERM', () => lbFlushAndExit('SIGTERM'));
+process.once('SIGINT', () => lbFlushAndExit('SIGINT'));
 
 /* -----------------------------------------------------------------------------
    MESSAGES CLIENT -> SERVEUR
