@@ -349,7 +349,8 @@ const server =
           rooms: rooms.size,
           clients: wss
             ? wss.clients.size
-            : 0
+            : 0,
+          leaderboard: typeof lbPlayers !== 'undefined' ? lbPlayers.size : 0
         })
       );
 
@@ -1552,36 +1553,16 @@ function pickEnemyType() {
   return ENEMY_TYPES.thrower;
 }
 
-/* ---- Vagues : équilibrage selon la vague et le nombre de joueurs ---- */
-function wavePlayersMult(sim) { return sim.players.length >= 2 ? 1.6 : 1; }
-function waveHpMult(sim) { return (1 + 0.06 * Math.max(0, sim.wave - 1)) * wavePlayersMult(sim); }
-function waveTargetFor(sim) {
-  const base = Math.min(12, 4 + sim.wave);
-  return sim.players.length >= 2 ? Math.ceil(base * 1.5) : base;
-}
-function waveMaxEnemies(sim) { return sim.players.length >= 2 ? COOP_MAX_ENEMIES + 3 : COOP_MAX_ENEMIES; }
-// Début de vague : toutes les 5 vagues, un boss remplace les ennemis normaux.
-function beginWave(sim) {
-  sim.waveSpawned = 0;
-  sim.waveTarget = waveTargetFor(sim);
-  ev(sim, { k:'wave', n:sim.wave, phase:'start' });
-  if (sim.wave % 5 === 0 && !sim.boss) {
-    sim.waveSpawned = sim.waveTarget;
-    spawnBoss(sim, sim.wave);
-  }
-}
-
 function spawnEnemy(sim) {
   const t =
     pickEnemyType();
 
-  let hp =
+  const hp =
     t.hpBase +
     Math.floor(
       sim.score / 120
     ) *
       2;
-  if (sim.mode === 'waves') hp = Math.round(hp * waveHpMult(sim));
 
   const fromLeft =
     Math.random() <
@@ -1654,7 +1635,6 @@ function spawnEnemy(sim) {
 function checkBossTrigger(
   sim
 ) {
-  if (sim.mode === 'waves') return;   // Vagues : boss planifiés (toutes les 5 vagues)
   const tier =
     Math.floor(
       sim.score / 200
@@ -1695,7 +1675,7 @@ function spawnBoss(
   sim,
   tier
 ) {
-  let hp =
+  const hp =
     Math.round(
       (
         260 +
@@ -1703,7 +1683,6 @@ function spawnBoss(
       ) *
         COOP_BOSS_HP_MULT
     );
-  if (sim.mode === 'waves') hp = Math.round(hp * (1 + 0.06 * Math.max(0, tier - 1)) * wavePlayersMult(sim));
 
   const avgX =
     sim.players.reduce(
@@ -2858,22 +2837,6 @@ function updateProjectiles(
             }
           }
         }
-      } else if (pr.weapon === 'enemy') {
-        // Tir d'ennemi (Coop / Vagues) : touche les JOUEURS (jamais les ennemis ni le boss)
-        for (const p of sim.players) {
-          if (
-            p.alive &&
-            !pr.hitSlots.has(p.slot) &&
-            rectsIntersect(hitbox, p)
-          ) {
-            if (damagePlayer(sim, p, pr.damage, pr.x)) {
-              pr.hitSlots.add(p.slot);
-              ev(sim, { k: 'phit', w: pr.weapon, x: r1(pr.x), y: r1(pr.y), d: pr.damage });
-              pr.dead = true;
-              break;
-            }
-          }
-        }
       } else {
         for (
           const en of
@@ -3077,7 +3040,7 @@ function stepSim(
       );
 
       if (sim.mode === 'waves') {
-        beginWave(sim);
+        ev(sim, { k: 'wave', n: sim.wave, phase: 'start' });
       }
 
       if (
@@ -3144,10 +3107,12 @@ function stepSim(
         sim.waveBreak -= dt * 1000;
         if (sim.waveBreak <= 0) {
           sim.wave++;
+          sim.waveSpawned = 0;
+          sim.waveTarget = Math.min(12, 4 + sim.wave);
           sim.spawnTimer = sim.spawnInterval;
-          beginWave(sim);
+          ev(sim, { k:'wave', n:sim.wave, phase:'start' });
         }
-      } else if (sim.spawnTimer >= sim.spawnInterval && alive < (sim.mode === 'waves' ? waveMaxEnemies(sim) : COOP_MAX_ENEMIES) &&
+      } else if (sim.spawnTimer >= sim.spawnInterval && alive < COOP_MAX_ENEMIES &&
           (sim.mode !== 'waves' || sim.waveSpawned < sim.waveTarget)) {
         sim.spawnTimer = 0;
         spawnEnemy(sim);
@@ -3870,7 +3835,7 @@ setInterval(
    durée/valeur, limites de débit) réduisent la triche mais ne l'excluent pas.
    ----------------------------------------------------------------------------- */
 
-const LB_FILE = process.env.LB_FILE || path.join(__dirname, 'leaderboard.json');
+const LB_FILE = path.resolve(process.env.LB_FILE || path.join(__dirname, 'leaderboard.json'));
 const LB_MAX_PLAYERS = 5000;
 const LB_TOP = 50;
 const LB_MAX_WAVE = 300;
@@ -3909,20 +3874,28 @@ function lbLoad() {
   }
 }
 
+function lbSaveNow() {
+  try {
+    // Crée le dossier du disque persistant si nécessaire.
+    fs.mkdirSync(path.dirname(LB_FILE), { recursive: true });
+    const out = { v: 1, players: {} };
+    for (const [id, e] of lbPlayers) out.players[id] = e;
+    const tmp = LB_FILE + '.tmp-' + process.pid;
+    fs.writeFileSync(tmp, JSON.stringify(out), 'utf8');
+    fs.renameSync(tmp, LB_FILE);
+    return true;
+  } catch (e) {
+    console.error('[leaderboard] écriture impossible (' + LB_FILE + ') :', e.message);
+    return false;
+  }
+}
+
 function lbSaveSoon() {
   if (lbSaveTimer) return;
   lbSaveTimer = setTimeout(() => {
     lbSaveTimer = null;
-    try {
-      const out = { v: 1, players: {} };
-      for (const [id, e] of lbPlayers) out.players[id] = e;
-      const tmp = LB_FILE + '.tmp';
-      fs.writeFileSync(tmp, JSON.stringify(out));
-      fs.renameSync(tmp, LB_FILE);
-    } catch (e) {
-      console.error('[leaderboard] écriture impossible :', e.message);
-    }
-  }, 2000);
+    lbSaveNow();
+  }, 750);
 }
 
 function lbRanked(kind) {
@@ -4021,12 +3994,21 @@ function lbHandle(ws, m) {
   const vk = kind, tk = kind + 'At';
   let improved = false;
   if (v > e[vk]) { e[vk] = v; e[tk] = now; improved = true; }   // uniquement les vrais records
-  if (improved || true) lbSaveSoon();
+  // Le pseudo est actualisé même si le record ne progresse pas : persister aussi ce changement.
+  lbSaveSoon();
   send(ws, { t: 'lb_ack', ok: true, kind, improved });
   lbSendBoard(ws, kind, id);
 }
 
 lbLoad();
+
+// Dernière sauvegarde lors d'un arrêt propre (déploiement/redémarrage).
+function lbShutdownSave() {
+  if (lbSaveTimer) { clearTimeout(lbSaveTimer); lbSaveTimer = null; }
+  lbSaveNow();
+}
+process.once('SIGTERM', lbShutdownSave);
+process.once('SIGINT', lbShutdownSave);
 
 /* -----------------------------------------------------------------------------
    MESSAGES CLIENT -> SERVEUR
